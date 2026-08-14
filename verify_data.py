@@ -25,19 +25,29 @@ dataset.py 의 __getitem__ 이 이렇게 되어 있다.
 ────────────────────────────────────────────────────────────────────
  1  PKL 을 읽고 데이터셋 폴더가 전부 있나                    전수
  2  meta/info.json 이 전부 읽히고 필요한 키가 있나           전수
- 3  parquet · mp4 가 전부 있고 0바이트가 아닌가              전수
- 4  ★ mp4 를 전부 열어 해상도·프레임수 확인                  전수
- 5  ★ parquet 을 전부 열어 행수·컬럼 확인                    전수
- 6  16프레임 미만으로 버려지는 비율
- 7  표본을 실제로 디코드해 픽셀·상태값까지 확인
- 8  action_stats 가 정상인가
- 9  action extractor 체크포인트가 있나
-10  사전학습 3종이 받아지나   EVA-02 · SDXL VAE · mc3_18
-11  진짜 DataLoader 로 배치 뽑기 (모양·범위·NaN)
-12  GPU 에 모델 올리기 (OOM 사전 확인)
-13  디스크 여유
+ 3  ★★★ train.py 가 PKL "만" 쓰는지                        팀 지시 항목
+ 4  parquet · mp4 가 전부 있고 0바이트가 아닌가              전수
+ 5  ★ mp4 를 전부 열어 해상도·프레임수 확인                  전수
+ 6  ★ parquet 을 전부 열어 행수·컬럼 확인                    전수
+ 7  16프레임 미만으로 버려지는 비율
+ 8  표본을 실제로 디코드해 픽셀·상태값까지 확인
+ 9  action_stats 가 정상인가
+10  action extractor 체크포인트가 있나
+11  사전학습 3종이 받아지나   EVA-02 · SDXL VAE · mc3_18
+12  진짜 DataLoader 로 배치 뽑기 (모양·범위·NaN)
+13  GPU 에 모델 올리기 (OOM 사전 확인)
+14  디스크 여유
 
-★ 4번이 특히 중요하다. dataset.py 는 원본 해상도를 그대로 두는데
+★★★ 3번이 팀이 확인하라고 한 바로 그 항목이다. train.py 240 줄이
+
+    index = EpisodeIndex.load(cache) if cache.exists() else EpisodeIndex(args.train_root)
+
+  이라, PKL 을 못 찾으면 오류 없이 train_root 전체를 훑어 다른 인덱스를
+  만든다. 학습은 정상으로 돌고 로스도 나오므로 눈으로는 못 잡는다.
+  그래서 (가) PKL 갈래를 타는지 (나) PKL 밖에 뭐가 있는지
+  (다) train.py 와 똑같이 만든 인덱스가 PKL 과 같은지 셋 다 본다.
+
+★ 5번도 중요하다. dataset.py 는 원본 해상도를 그대로 두는데
   (_preprocess_frame), 배치에 해상도가 다른 에피소드가 섞이면 collate 의
   torch.stack 이 터진다. 이 오류는 __getitem__ 밖에서 나므로 예외 삼키기로
   안 막히고, 학습 도중에 죽는다.
@@ -201,7 +211,7 @@ def main() -> int:
     infos, bad = {}, []
     for r in roots:
         try:
-            infos[str(r)] = json.loads((r / "meta" / "info.json").read_text())
+            infos[str(r)] = json.loads((r / "meta" / "info.json").read_text(encoding="utf-8"))
         except Exception as e:
             bad.append((r, str(e)[:60]))
     ck("info.json 전부 읽힘 (%d개)" % len(roots), not bad,
@@ -216,7 +226,133 @@ def main() -> int:
         return 1
 
     # ------------------------------------------------------------ 3
-    head("3. parquet · mp4 존재 + 0바이트 검사 (%s개)" % format(len(entries), ","))
+    head("3. ★★★ train.py 가 PKL 만 쓰는지 — 팀 지시의 바로 그 항목")
+    # 팀 지시 원문:
+    #   "학습 전엔 한가지 그 PKL 파일에 있는 경로들로만 학습데이터로 잘
+    #    들어가고있는게 맞는지 확인만 해주세요"
+    #
+    # train.py 240 줄:
+    #   index = EpisodeIndex.load(cache) if cache.exists() else EpisodeIndex(args.train_root)
+    #
+    # PKL 을 못 찾으면 오류를 내지 않고 train_root 전체를 훑어 다른 인덱스를
+    # 만든다. 학습은 정상으로 돌고 로스도 나온다. 눈으로는 절대 못 잡는다.
+    # "로만" 을 증명하려면 세 가지를 봐야 한다.
+    #   (가) train.py 가 정말 PKL 갈래를 타는가
+    #   (나) PKL 밖에 뭐가 더 있는가        (폴더 전수 스캔과 대조)
+    #   (다) train.py 와 똑같이 만든 인덱스가 PKL 과 정확히 같은가
+    def key(x):
+        return str(Path(x).resolve())
+
+    troot = Path(args.train_root)
+    pklset = {(key(r), int(e)) for r, e, _ in entries}
+
+    print("  --- (가) train.py 가 PKL 갈래를 타는가 ---")
+    # 내 기본값이 아니라 train.py 의 기본값을 코드에서 직접 읽는다.
+    # 내 스크립트만 통과하고 train.py 는 다른 걸 쓰는 상황을 막기 위해서다.
+    import ast as _ast
+    tp = Path("train.py")
+    tdef = {}
+    if tp.exists():
+        # utf-8-sig: train.py 는 파일 앞에 BOM 이 붙어 있다.
+        # 그냥 utf-8 로 읽으면 ast.parse 가 U+FEFF 로 터진다.
+        for nd in _ast.walk(_ast.parse(tp.read_text(encoding="utf-8-sig"))):
+            if (isinstance(nd, _ast.Call) and getattr(nd.func, "attr", "") == "add_argument"
+                    and nd.args and isinstance(nd.args[0], _ast.Constant)):
+                for kw in nd.keywords:
+                    if kw.arg == "default" and isinstance(kw.value, _ast.Constant):
+                        tdef[nd.args[0].value.lstrip("-").replace("-", "_")] = kw.value.value
+    if not ck("train.py 를 읽어 기본값 추출", bool(tdef), "인자 %d개" % len(tdef)):
+        print("      -> cd /workspace/v3_ar 에서 실행해야 한다.")
+        return 1
+    t_cache = str(tdef.get("index_cache", args.pkl))
+    t_root = str(tdef.get("train_root", args.train_root))
+    print("      현재 작업 폴더   %s" % Path.cwd())
+    print("      train.py 기본값  --index-cache %s   --train-root %s" % (t_cache, t_root))
+    ck("내 --pkl 이 train.py 기본값과 같음", t_cache == str(args.pkl),
+       "" if t_cache == str(args.pkl) else "다르면 엉뚱한 인덱스를 검증하는 셈")
+    ck("내 --train-root 가 train.py 기본값과 같음", t_root == str(args.train_root))
+    here = Path(t_cache).exists()
+    ck("★ train.py 가 PKL 갈래를 탄다 (cache.exists() 가 True)", here)
+    if not here:
+        print("      -> train.py 는 %s 를 '현재 폴더 기준'으로 찾는다." % t_cache)
+        print("         지금 폴더에 없으므로 train.py 는 전체 스캔으로 빠진다.")
+        print("         반드시 cd /workspace/v3_ar 에서 python train.py 로 실행할 것.")
+        return 1
+
+    print("  --- (나) PKL 밖에 뭐가 더 있는가 ---")
+    # EpisodeIndex.__init__ 과 같은 방식으로 훑되 parquet 을 열지 않아 빠르다.
+    # 목적은 개수 대조이지 프레임수가 아니다.
+    scan, ds_all = set(), set()
+    for ip in sorted(troot.rglob("meta/info.json")):
+        droot = ip.parent.parent
+        ds_all.add(key(droot))
+        try:
+            inf = json.loads(ip.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        cs = inf.get("chunks_size", 1000)
+        for e in range(inf.get("total_episodes", 0)):
+            if (droot / inf["data_path"].format(
+                    episode_chunk=e // cs, episode_index=e)).exists():
+                scan.add((key(droot), e))
+    extra, lost = scan - pklset, pklset - scan
+    print("      폴더 전수 스캔   에피소드 %8s개 · 데이터셋 %3d개"
+          % (format(len(scan), ","), len(ds_all)))
+    print("      PKL             에피소드 %8s개 · 데이터셋 %3d개"
+          % (format(len(pklset), ","), len(roots)))
+    print("      PKL 이 걸러낸 것 %s개 — PKL 갈래를 타므로 학습에 안 들어간다"
+          % format(len(extra), ","))
+    for k_, e_ in sorted(extra)[:3]:
+        print("         제외됨: %s ep%d" % (Path(k_).name, e_))
+    ck("PKL 의 에피소드가 폴더에 전부 실재함", not lost,
+       "" if not lost else "폴더에 없는 PKL 항목 %d개" % len(lost))
+    for k_, e_ in sorted(lost)[:5]:
+        print("         없음: %s ep%d" % (k_, e_))
+    if lost:
+        print("      -> PKL 이 가리키는 데이터가 없다. open.zip 배치를 다시 볼 것.")
+        return 1
+    # 구분자를 직접 붙이지 않는다. Path.parents 로 판정해야 OS 를 안 탄다.
+    _tr = Path(key(troot))
+
+    def under(k_):
+        q = Path(k_)
+        return q == _tr or _tr in q.parents
+
+    out = sorted({k_ for k_, _ in pklset if not under(k_)})
+    ck("PKL 경로가 전부 train_root 안에 있음", not out,
+       "" if not out else "밖 %d개" % len(out))
+    for k_ in out[:3]:
+        print("         밖: %s" % k_)
+    if out:
+        return 1
+
+    print("  --- (다) train.py 와 똑같이 만든 인덱스가 PKL 과 같은가 ---")
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    try:
+        from dataset import EpisodeIndex as _EI
+    except Exception as e:
+        ck("dataset.py 임포트", False, str(e)[:60])
+        print("      -> bash setup.sh 를 먼저 돌릴 것.")
+        return 1
+    _c = Path(t_cache)
+    _idx = _EI.load(_c) if _c.exists() else _EI(t_root)   # ← train.py 240 줄 그대로
+    got = {(key(r), int(e)) for r, e, _ in _idx.entries}
+    ck("★ train.py 방식 인덱스 == PKL (전부 일치)", got == pklset,
+       "%s개" % format(len(got), ","))
+    if got != pklset:
+        print("      들어오면 안 되는데 들어온 것 %d개" % len(got - pklset))
+        print("      들어와야 하는데 빠진 것   %d개" % len(pklset - got))
+        return 1
+    ge = len([1 for _, _, n in _idx.entries if n >= SEQ_LEN])
+    print("      이 중 16프레임 이상 %s개만 실제 학습에 쓰인다 (LeRobotSequenceDataset)"
+          % format(ge, ","))
+    print("      train.py 는 여기서 다시 5% 를 val 로 뗀다 (split_index_by_episode)")
+    print("      -> 학습 %s개 · 검증 %s개 (근사)"
+          % (format(int(ge * 0.95), ","), format(ge - int(ge * 0.95), ",")))
+    ck("학습에 쓸 에피소드가 남음", ge > 0)
+
+    # ------------------------------------------------------------ 4
+    head("4. parquet · mp4 존재 + 0바이트 검사 (%s개)" % format(len(entries), ","))
     t0 = time.time()
     mpq, mmp, zero = [], [], []
     for r, ep, n in entries:
@@ -241,8 +377,8 @@ def main() -> int:
         print("         학습은 돌아가지만 그만큼 데이터를 잃는다.")
         return 1
 
-    # ------------------------------------------------------------ 4
-    head("4. ★ mp4 전수 열기 — 해상도·프레임수  (배치 collate 가 여기서 터진다)")
+    # ------------------------------------------------------------ 5
+    head("5. ★ mp4 전수 열기 — 해상도·프레임수  (배치 collate 가 여기서 터진다)")
     import av
 
     def probe_mp4(item):
@@ -302,8 +438,8 @@ def main() -> int:
     if verr:
         return 1
 
-    # ------------------------------------------------------------ 5
-    head("5. ★ parquet 전수 열기 — 행수·컬럼")
+    # ------------------------------------------------------------ 6
+    head("6. ★ parquet 전수 열기 — 행수·컬럼")
     import pandas as pd
 
     def probe_pq(item):
@@ -325,6 +461,8 @@ def main() -> int:
         print("  전수 %s개 (병렬 %d)" % (format(len(pq_targets), ","), args.workers))
     t0 = time.time()
     perr, nocol, mismatch, short_pq = [], [], [], []
+    # 루프 밖에서 한 번만 만든다. 안에서 만들면 6,298 x 6,298 이라 몇 시간 걸린다.
+    want_n = {(str(a), b): c for a, b, c in entries}
     with ThreadPoolExecutor(max_workers=args.workers) as ex:
         for i, (r, ep, nrow, hascol, err) in enumerate(ex.map(probe_pq, pq_targets), 1):
             if err:
@@ -332,7 +470,7 @@ def main() -> int:
                 continue
             if not hascol:
                 nocol.append((r, ep))
-            want = dict(((str(a), b), c) for a, b, c in entries).get((str(r), ep))
+            want = want_n.get((str(r), ep))
             if want is not None and nrow != want:
                 mismatch.append((r, ep, want, nrow))
             if nrow < SEQ_LEN:
@@ -353,8 +491,8 @@ def main() -> int:
     if perr or nocol:
         return 1
 
-    # ------------------------------------------------------------ 6
-    head("6. 16프레임 미만으로 버려지는 에피소드")
+    # ------------------------------------------------------------ 7
+    head("7. 16프레임 미만으로 버려지는 에피소드")
     short = [(r, ep, n) for r, ep, n in entries if n < SEQ_LEN]
     usable = len(entries) - len(short)
     print("  16프레임 미만 %d개 (%.2f%%)" % (len(short), len(short) / max(len(entries), 1) * 100))
@@ -363,8 +501,8 @@ def main() -> int:
         warn("버려지는 비율이 10%% 를 넘는다 (%d개)" % len(short))
     ck("쓸 수 있는 에피소드가 있음", usable > 0)
 
-    # ------------------------------------------------------------ 7
-    head("7. 표본 %d개 실제 디코드 (픽셀·상태값까지)" % args.sample)
+    # ------------------------------------------------------------ 8
+    head("8. 표본 %d개 실제 디코드 (픽셀·상태값까지)" % args.sample)
     import numpy as np
     picks = random.sample(entries, min(args.sample, len(entries)))
     okn, errs = 0, []
@@ -408,29 +546,29 @@ def main() -> int:
     if errs:
         return 1
 
-    # ------------------------------------------------------------ 8
-    head("8. action_stats")
+    # ------------------------------------------------------------ 9
+    head("9. action_stats")
     sp = Path(args.action_stats)
     if not ck("파일 존재  %s" % sp, sp.exists()):
         return 1
-    stt = json.loads(sp.read_text())
+    stt = json.loads(sp.read_text(encoding="utf-8"))
     ck("mean 6차원", len(stt.get("mean", [])) == 6, str([round(x, 2) for x in stt.get("mean", [])])[:56])
     ck("std 6차원", len(stt.get("std", [])) == 6, str([round(x, 2) for x in stt.get("std", [])])[:56])
     ck("std 에 0 없음", all(abs(x) > 1e-9 for x in stt.get("std", [1])))
 
-    # ------------------------------------------------------------ 9
-    head("9. action extractor 체크포인트")
+    # ------------------------------------------------------------ 10
+    head("10. action extractor 체크포인트")
     acp = Path(args.action_ckpt)
     ck("파일 존재  %s" % acp, acp.exists(),
        "" if not acp.exists() else "%.1f MB" % (acp.stat().st_size / 1048576))
     if not acp.exists():
         return 1
 
-    # ------------------------------------------------------------ 10
+    # ------------------------------------------------------------ 11
     if args.skip_models:
-        head("10. 사전학습 모델 - 건너뜀")
+        head("11. 사전학습 모델 - 건너뜀")
     else:
-        head("10. 사전학습 3종 (없으면 학습 시작 직후 죽는다)")
+        head("11. 사전학습 3종 (없으면 학습 시작 직후 죽는다)")
         t0 = time.time()
         try:
             import timm
@@ -456,8 +594,8 @@ def main() -> int:
             ck("mc3_18", False, str(e)[:60])
         print("  소요 %.1f초" % (time.time() - t0))
 
-    # ------------------------------------------------------------ 11
-    head("11. 진짜 DataLoader 로 배치 뽑기 (batch=%d, %d배치)" % (args.batch_size, args.batches))
+    # ------------------------------------------------------------ 12
+    head("12. 진짜 DataLoader 로 배치 뽑기 (batch=%d, %d배치)" % (args.batch_size, args.batches))
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     import torch
     from torch.utils.data import DataLoader
@@ -488,7 +626,7 @@ def main() -> int:
     except Exception as e:
         ck("DataLoader 배치 생성", False, str(e)[:70])
         if "stack" in str(e).lower() or "size" in str(e).lower():
-            print("      -> 4번 해상도 결과를 볼 것. 크기가 섞여 collate 가 터졌을 가능성.")
+            print("      -> 5번 해상도 결과를 볼 것. 크기가 섞여 collate 가 터졌을 가능성.")
         return 1
     el = time.time() - t0
     print("  %d배치 %.1f초 (배치당 %.2f초)" % (seen, el, el / max(seen, 1)))
@@ -496,11 +634,11 @@ def main() -> int:
         print("  참고: 데이터 로딩만 따지면 20,000스텝에 약 %.1f시간" % (el / seen * 20000 / 3600))
         print("        (실제 학습은 GPU 연산이 더해지므로 이보다 오래 걸린다)")
 
-    # ------------------------------------------------------------ 12
+    # ------------------------------------------------------------ 13
     if args.skip_gpu or not torch.cuda.is_available():
-        head("12. GPU - 건너뜀")
+        head("13. GPU - 건너뜀")
     else:
-        head("12. GPU 에 모델 올리기 (OOM 사전 확인)")
+        head("13. GPU 에 모델 올리기 (OOM 사전 확인)")
         try:
             from model import ImageEditingModel
             dev = torch.device("cuda")
@@ -514,8 +652,8 @@ def main() -> int:
         except Exception as e:
             ck("모델 GPU 적재", False, str(e)[:70])
 
-    # ------------------------------------------------------------ 13
-    head("13. 디스크 여유")
+    # ------------------------------------------------------------ 14
+    head("14. 디스크 여유")
     for p in (Path("."), Path("/workspace")):
         try:
             t, u, fr = shutil.disk_usage(p)

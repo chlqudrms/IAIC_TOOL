@@ -67,7 +67,7 @@ runs/extractor_v2/best.pt
 
 ```bash
 cd /workspace
-git clone -q https://github.com/chlqudrms/iaic-tools.git _tools
+git clone -q https://github.com/chlqudrms/IAIC_TOOL.git _tools
 cp _tools/verify_data.py _tools/setup.sh /workspace/v3_ar/ && rm -rf _tools
 ```
 
@@ -136,21 +136,48 @@ nvidia-smi --query-gpu=utilization.gpu,memory.used --format=csv,noheader
 
 검증이 오류로 죽어도 **아무것도 안 바뀝니다.** 다시 돌리거나 건너뛰고 학습해도 됩니다.
 
-**검사 12가지**
+**검사 14가지**
 
 ```
  1  PKL 의 데이터셋 폴더가 전부 있나                전수
  2  meta/info.json 이 전부 읽히나                  전수
- 3  parquet · mp4 가 전부 있나                     전수
- 4  ★ 해상도가 전부 같은가
- 5  16프레임 미만으로 버려지는 비율
- 6  표본을 실제로 열어 프레임·상태가 읽히나
- 7  action_stats 가 6차원 mean/std 인가
- 8  action extractor 체크포인트가 있나
- 9  사전학습 3종이 받아지나  EVA-02 · SDXL VAE · mc3_18
-10  진짜 DataLoader 로 배치 뽑기 (모양·범위·NaN)
-11  GPU 에 모델 올리기 (OOM 사전 확인)
-12  디스크 여유
+ 3  ★★★ train.py 가 PKL "만" 쓰는지               ← 팀이 확인하라고 한 항목
+ 4  parquet · mp4 가 전부 있고 0바이트가 아닌가     전수
+ 5  ★ mp4 를 전부 열어 해상도·프레임수             전수
+ 6  ★ parquet 을 전부 열어 행수·컬럼               전수
+ 7  16프레임 미만으로 버려지는 비율
+ 8  표본 100개를 픽셀까지 디코드
+ 9  action_stats 가 6차원 mean/std 인가
+10  action extractor 체크포인트가 있나
+11  사전학습 3종이 받아지나  EVA-02 · SDXL VAE · mc3_18
+12  진짜 DataLoader 로 배치 뽑기 (모양·범위·NaN)
+13  GPU 에 모델 올리기 (OOM 사전 확인)
+14  디스크 여유
+```
+
+### 3번이 팀 지시의 바로 그 항목
+
+> 학습 전엔 한가지 그 PKL 파일에 있는 경로들**로만** 학습데이터로 잘 들어가고있는게 맞는지 확인만 해주세요
+
+`train.py` 240줄이 이렇게 되어 있습니다.
+
+```python
+index = EpisodeIndex.load(cache) if cache.exists() else EpisodeIndex(args.train_root)
+```
+
+**PKL을 못 찾으면 오류를 내지 않고 `train_root` 전체를 훑어 다른 인덱스를 만듭니다.** 학습은 정상으로 돌고 로스도 나옵니다. 눈으로는 못 잡습니다.
+
+`cache.exists()`는 **현재 폴더 기준**이라, `python /workspace/v3_ar/train.py`처럼 다른 위치에서 실행하면 그대로 전체 스캔으로 빠집니다. **반드시 `cd /workspace/v3_ar` 후 실행하세요.**
+
+그래서 세 가지를 봅니다.
+
+```
+(가) train.py 가 PKL 갈래를 타는가
+     train.py 의 argparse 기본값을 코드에서 직접 읽어 대조한다
+(나) PKL 밖에 뭐가 더 있는가
+     폴더를 전수 스캔해 PKL 과 대조. 걸러진 개수를 숫자로 보여준다
+(다) train.py 와 똑같은 식으로 만든 인덱스가 PKL 과 정확히 같은가
+     EpisodeIndex.load(cache) if cache.exists() else ... 를 그대로 실행해 집합 비교
 ```
 
 ### 왜 전수로 봐야 하나
@@ -165,7 +192,7 @@ for _ in range(10):
 
 **파일이 없거나 깨져도 예외를 삼키고 넘어갑니다.** 데이터가 절반만 있어도 학습은 정상으로 보이고 로스도 나옵니다. "안 죽으니까 괜찮다"가 성립하지 않습니다.
 
-### 4번이 특히 중요한 이유
+### 5번이 특히 중요한 이유
 
 `dataset.py`는 **원본 해상도를 그대로 둡니다**(`_preprocess_frame`). 배치에 해상도가 다른 에피소드가 섞이면 collate의 `torch.stack`이 터집니다. **이 오류는 `__getitem__` 밖에서 나므로 예외 삼키기로도 안 막히고, 학습 도중에 죽습니다.**
 

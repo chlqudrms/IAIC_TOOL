@@ -22,15 +22,17 @@ PY
 echo ""
 echo "===== 2. 패키지 설치 ====="
 # --break-system-packages: RunPod 기본 이미지는 PEP668 로 시스템 파이썬이 잠겨 있다
+# pyarrow: dataset.py 152 줄의 pd.read_parquet 이 학습 매 스텝마다 쓴다.
+#          pandas 가 자동으로 깔아주지 않아 빠지면 첫 스텝에서 죽는다.
 pip install -q --no-input --break-system-packages \
-    timm diffusers av pandas tensorboard 2>&1 | tail -2
+    timm diffusers av pandas pyarrow tensorboard 2>&1 | tail -2
 
 echo ""
 echo "===== 3. 임포트 확인 ====="
 python - <<'PY'
 import importlib, sys
 ok = True
-need = ["torch", "torchvision", "timm", "diffusers", "av", "pandas", "numpy"]
+need = ["torch", "torchvision", "timm", "diffusers", "av", "pandas", "pyarrow", "numpy"]
 for m in need:
     try:
         x = importlib.import_module(m)
@@ -66,5 +68,5 @@ echo ""
 echo "준비 완료. 다음 순서:"
 echo "  export HF_HOME=/workspace/.cache/huggingface"
 echo "  cd /workspace/v3_ar"
-echo "  python verify_data.py        # 학습 전 점검 12가지"
+echo "  python verify_data.py        # 학습 전 점검 14가지"
 echo "  python train.py              # 통과하면 학습 시작"

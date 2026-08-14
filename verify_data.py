@@ -365,17 +365,54 @@ def main() -> int:
             except FileNotFoundError:
                 box.append(p)
     print("  소요 %.1f초" % (time.time() - t0))
+
+    # mp4 가 없는 이유를 갈라 본다.
+    #   (A) 그 데이터셋이 영상 폴더 이름을 다르게 쓴다 -> 코드 수정 없이는 못 쓴다.
+    #       dataset.py 는 VIDEO_KEY = "observation.images.image" 로 고정돼 있다.
+    #       팀 지시가 "코드 수정 없이 실행만" 이므로 이건 감수하고 진행한다.
+    #   (B) 그 밖의 이유 -> 데이터 배치가 잘못된 것이다. 반드시 멈춘다.
+    keymiss, realmiss, altkeys = [], [], {}
+    for p in mmp:
+        try:
+            vd = p.parent.parent           # videos/chunk-000
+            ks = sorted(q.name for q in vd.iterdir() if q.is_dir()) if vd.is_dir() else []
+        except Exception:
+            ks = []
+        if ks and VIDEO_KEY not in ks:
+            keymiss.append(p)
+            altkeys.setdefault(str(p.parent.parent.parent.parent), ks)
+        else:
+            realmiss.append(p)
+
     ck("parquet 전부 존재", not mpq, "" if not mpq else "없음 %d개" % len(mpq))
-    ck("mp4 전부 존재", not mmp, "" if not mmp else "없음 %d개" % len(mmp))
+    ck("mp4 전부 존재 (영상키 불일치 제외)", not realmiss,
+       "" if not realmiss else "없음 %d개" % len(realmiss))
     ck("0바이트 파일 없음", not zero, "" if not zero else "0바이트 %d개" % len(zero))
-    for p in (mpq[:3] + mmp[:3] + zero[:3]):
+    for p in (mpq[:3] + realmiss[:3] + zero[:3]):
         print("      문제: %s" % p)
-    if mpq or mmp or zero:
-        b = len(set(mpq) | set(mmp) | set(zero))
+    if mpq or realmiss or zero:
+        b = len(set(mpq) | set(realmiss) | set(zero))
         print("      -> 전체의 %.1f%% 를 못 쓴다. __getitem__ 이 조용히 건너뛰므로"
               % (b / max(len(entries) * 2, 1) * 100))
         print("         학습은 돌아가지만 그만큼 데이터를 잃는다.")
         return 1
+
+    # 영상 폴더 이름이 다른 데이터셋 — 멈추지 않고 정확히 알린다
+    skip_ep = set()
+    if keymiss:
+        skip_ep = {str(p) for p in keymiss}
+        warn("영상 폴더 이름이 달라 못 읽는 에피소드 %d개 (%.2f%%)"
+             % (len(keymiss), len(keymiss) / max(len(entries), 1) * 100))
+        print("")
+        print("      dataset.py 는 VIDEO_KEY = \"%s\" 로 고정돼 있다." % VIDEO_KEY)
+        print("      아래 데이터셋은 폴더 이름이 달라 학습에 안 들어간다.")
+        for d, ks in sorted(altkeys.items()):
+            print("         %-44s 실제 폴더 %s" % ("/".join(d.split("/")[-2:]), ks))
+        print("")
+        print("      코드를 고쳐야 살릴 수 있는데 팀 지시가 \"수정 없이 실행만\" 이다.")
+        print("      -> 이대로 진행한다. 학습에 쓰이는 에피소드는 %s개."
+              % format(len(entries) - len(keymiss), ","))
+        print("      -> 팀에 알릴 것. 우리가 만든 문제가 아니라 PKL 과 데이터의 불일치다.")
 
     # ------------------------------------------------------------ 5
     head("5. ★ mp4 전수 열기 — 해상도·프레임수  (배치 collate 가 여기서 터진다)")
@@ -391,14 +428,17 @@ def main() -> int:
         except Exception as e:
             return (r, ep, None, -1, str(e)[:60])
 
+    # 영상키가 달라 애초에 못 여는 것은 빼고 본다 (위에서 이미 알렸다)
+    usable = [(r, ep, n) for r, ep, n in entries
+              if str(vpath(r, infos[str(r)], ep)) not in skip_ep]
     if args.quick:
         seen = {}
-        for r, ep, n in entries:
+        for r, ep, n in usable:
             seen.setdefault(str(r), (r, ep, n))
         targets = list(seen.values())
         print("  --quick: 데이터셋당 1개씩 %d개" % len(targets))
     else:
-        targets = entries
+        targets = usable
         print("  전수 %s개 (병렬 %d)" % (format(len(targets), ","), args.workers))
     t0 = time.time()
     res, res_where, verr, nf_bad = Counter(), {}, [], []
@@ -504,7 +544,8 @@ def main() -> int:
     # ------------------------------------------------------------ 8
     head("8. 표본 %d개 실제 디코드 (픽셀·상태값까지)" % args.sample)
     import numpy as np
-    picks = random.sample(entries, min(args.sample, len(entries)))
+    # entries 가 아니라 usable 에서 뽑는다. 못 여는 것을 뽑으면 헛되이 실패한다.
+    picks = random.sample(usable, min(args.sample, len(usable)))
     okn, errs = 0, []
     st_min, st_max = float("inf"), float("-inf")
     px_min, px_max = 255, 0

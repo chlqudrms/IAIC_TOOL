@@ -7,10 +7,19 @@
 ## 0. 포드 사양
 
 ```
-GPU              A40 48GB  또는  RTX A6000 48GB   (같은 Ampere GA102, 동등)
-컨테이너 디스크    30GB 이상
-네트워크 볼륨      30GB 이상 (train 10GB + 캐시 + 체크포인트 2GB)
+GPU              RTX PRO 6000        ← 승원 정정. "A6000" 은 잘못 말한 것
+컨테이너 디스크    40GB 이상
+네트워크 볼륨      30GB 이상 (train 8.5GB + 캐시 1GB + 체크포인트 2GB)
 ```
+
+**RTX PRO 6000 은 Blackwell(sm_120) 이라 A6000·A40(Ampere) 과 다른 세대입니다.** 오래된 torch 는 이 GPU용 커널이 없어 첫 연산에서 죽습니다. 포드를 켜면 **가장 먼저** 확인하세요.
+
+```bash
+python -c "import torch;print(torch.__version__, torch.version.cuda, torch.cuda.get_device_capability())"
+nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
+```
+
+`(12, 0)` 이 나와야 하고 torch 는 **2.7 이상 / CUDA 12.8 이상**이어야 합니다. 낮으면 RunPod 템플릿을 최신 PyTorch 이미지로 바꾸세요. (`verify_data.py` 13번이 실제로 모델을 올려서 이걸 잡습니다)
 
 ---
 
@@ -58,10 +67,13 @@ ls /workspace/v3_ar
 
 ```
 train.py  loss.py  model.py  dataset.py  infer.py
+setup.sh                      ← 커밋 6d5bd13 에서 추가됨
 action_extractor_indep.py
 episode_index_filtered.pkl
 runs/extractor_v2/best.pt
 ```
+
+`setup.sh` 가 안 보이면 **옛날 클론**입니다. 다시 받으세요. (팀이 나중에 추가했습니다)
 
 점검 도구도 같이 받습니다.
 
@@ -73,10 +85,20 @@ cp _tools/verify_data.py _tools/setup.sh /workspace/v3_ar/ && rm -rf _tools
 
 ---
 
-## 3. 환경 설치
+## 3. 환경 설치 — **팀 공식 setup.sh 를 씁니다**
 
 ```bash
 export HF_HOME=/workspace/.cache/huggingface
+bash /workspace/v3_ar/setup.sh
+```
+
+설치하는 것: `diffusers==0.31.0 timm av pandas pyarrow tensorboard accelerate transformers`
+그리고 SDXL VAE · EVA02-B · MC3-18 을 미리 받아둡니다. `[OK]` 세 줄이 나와야 정상입니다.
+
+**막힐 수 있는 지점 하나.** 이 스크립트는 `set -e` 라 첫 오류에서 즉시 멈춥니다. RunPod 이미지가 PEP668 로 잠겨 있으면 `pip install` 이 `externally-managed-environment` 로 실패합니다. 그때만 아래로 우회하고, **파일은 고치지 마세요.**
+
+```bash
+pip install --break-system-packages -q diffusers==0.31.0 timm av pandas pyarrow tensorboard accelerate transformers
 bash /workspace/v3_ar/setup.sh
 ```
 
@@ -96,11 +118,25 @@ DACON에서 받은 `open.zip`을 풀어 **이 구조**로 만듭니다.
 
 PKL이 **절대경로 `/workspace/data/train/...`** 를 들고 있어서 위치가 정확히 맞아야 합니다.
 
-압축이 `open/data/train/...` 구조로 풀리면 옮깁니다.
+PKL이 **절대경로**를 들고 있어 `/workspace/data/train/` 이 정확히 맞아야 합니다. `open1/data/train` 을 통째로 올리면 됩니다.
+
+### 올리는 법 — 로컬 PC 에서 (Git Bash)
+
+파일이 11,132 × 2개라 하나씩 보내면 느립니다. **묶어서 한 줄기로 흘려보냅니다.**
 
 ```bash
-mkdir -p /workspace/data
-mv /workspace/open/data/train /workspace/data/train
+cd /c/Users/chlqu/Downloads/open1/data && tar -cf - train | ssh -p <포트> root@<주소> "mkdir -p /workspace/data && tar -xf - -C /workspace/data"
+```
+
+mp4 는 이미 압축돼 있어 `gzip` 을 걸면 느려지기만 합니다. 안 겁니다.
+
+올린 뒤 **포드에서** 개수를 맞춰 보세요. 로컬과 같아야 합니다.
+
+```bash
+find /workspace/data/train -name "*.mp4" | wc -l      # 11132 나와야 함
+find /workspace/data/train -name "*.parquet" | wc -l  # 11132 나와야 함
+ls /workspace/data/train/so100_action_statistics.json
+du -sh /workspace/data/train                          # 8.5G
 ```
 
 ---
@@ -237,12 +273,31 @@ best.ckpt     val 최저 갱신 시
 학습 시간 약 12~20시간 (스텝당 2~3초 추정, 실측으로 확정할 것)
 ```
 
+### 🔴 팀이 중요하다고 한 것은 **500스텝마다 나오는 val 로스**
+
+> 넵 로스도 찍히는지 체크해주세용 500스텝 마다 나오는 val 로스가 중요합니닷 첨엔 클거에요
+
+**첫 val 이 크게 나오는 건 정상입니다.** 봐야 할 건 절대값이 아니라 **내려가는가**입니다.
+
+```bash
+grep -i "val" /workspace/train.log | tail -20
+```
+
+val 만 뽑아 추이를 보려면:
+
+```bash
+grep -oiE "step[^0-9]*[0-9]+.*val[^0-9]*[0-9.]+" /workspace/train.log | tail -20
+```
+
+**보고할 때는 스텝 번호와 val 값을 같이 적으세요.** 값 하나만으론 팀이 판단을 못 합니다.
+
 **볼 주기**
 
 ```
 시작 직후 5분      진짜 도는지, 로스가 숫자인지, GPU 100% 인지
-첫 val (500스텝)   NaN 아닌지
-그 뒤 1시간마다    train/val 추이, best 갱신, 디스크, GPU
+첫 val (500스텝)   ★ 숫자가 찍히는지, NaN 아닌지   — 여기까지 약 20분
+그 뒤 500스텝마다  ★ val 이 내려가는지 (약 20분 간격)
+1시간마다         train/val 추이, best 갱신, 디스크, GPU
 ```
 
 **즉시 중단해야 하는 신호**

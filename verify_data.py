@@ -534,12 +534,13 @@ def main() -> int:
     # ------------------------------------------------------------ 7
     head("7. 16프레임 미만으로 버려지는 에피소드")
     short = [(r, ep, n) for r, ep, n in entries if n < SEQ_LEN]
-    usable = len(entries) - len(short)
+    # 이름을 usable 로 쓰면 5번에서 만든 목록을 숫자로 덮어써 8번이 터진다
+    n_usable = len(entries) - len(short)
     print("  16프레임 미만 %d개 (%.2f%%)" % (len(short), len(short) / max(len(entries), 1) * 100))
-    print("  실제 학습에 쓰이는 에피소드 %s개" % format(usable, ","))
+    print("  실제 학습에 쓰이는 에피소드 %s개" % format(n_usable, ","))
     if len(short) > len(entries) * 0.1:
         warn("버려지는 비율이 10%% 를 넘는다 (%d개)" % len(short))
-    ck("쓸 수 있는 에피소드가 있음", usable > 0)
+    ck("쓸 수 있는 에피소드가 있음", n_usable > 0)
 
     # ------------------------------------------------------------ 8
     head("8. 표본 %d개 실제 디코드 (픽셀·상태값까지)" % args.sample)
